@@ -58,10 +58,8 @@ async function fetchAPI(url, options = {}) {
  * Create a new feedback
  */
 export async function createFeedback(feedbackData) {
-  const payload = {
-    ...feedbackData,
-    category: normalizeCategory(feedbackData.category),
-  };
+  const payload = { ...feedbackData };
+  delete payload.category;
   return fetchAPI(`${API_BASE_URL}/feedback`, {
     method: 'POST',
     headers: {

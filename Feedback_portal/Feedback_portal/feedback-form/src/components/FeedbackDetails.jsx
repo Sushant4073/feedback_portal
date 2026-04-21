@@ -82,13 +82,6 @@ const STATUS_CONFIG = {
   },
 };
 
-const CATEGORY_OPTIONS = [
-  { value: "DEFECT", label: "Defect" },
-  { value: "FEATURE", label: "Feature" },
-  { value: "ENHANCEMENT", label: "Improvement" },
-  { value: "OTHER", label: "Other" },
-];
-
 const STATUS_OPTIONS = ["OPEN", "IN_PROGRESS", "RESOLVED", "CLOSED"];
 
 const formatDate = (dateStr) => {
@@ -133,7 +126,7 @@ const FeedbackDetails = ({ mode = "view" }) => {
   const [formData, setFormData] = useState({
     title: "",
     description: "",
-    category: "DEFECT",
+    category: "",
     status: "OPEN",
   });
   const [commentInput, setCommentInput] = useState("");
@@ -251,7 +244,6 @@ const FeedbackDetails = ({ mode = "view" }) => {
       const result = await createFeedback({
         title: formData.title,
         description: formData.description,
-        category: formData.category,
         tenant_id: "default-tenant",
         user_id: "default-user",
       });
@@ -670,27 +662,17 @@ const FeedbackDetails = ({ mode = "view" }) => {
                   </Box>
                 )}
 
-                {/* Category - Editable in create mode only */}
+                {/* Category */}
                 <Box>
                   <Typography variant="subtitle1" fontWeight="600" mb={1} sx={{ color: "#37474f", fontSize: "0.875rem" }}>
                     Category
                   </Typography>
                   {isNewFeedback ? (
-                    <FormControl fullWidth>
-                      <InputLabel sx={{ bgcolor: "white", px: 1, borderRadius: 1 }}>Category</InputLabel>
-                      <Select
-                        value={formData.category}
-                        label="Category"
-                        onChange={handleFieldChange("category")}
-                        sx={{ borderRadius: 2 }}
-                      >
-                        {CATEGORY_OPTIONS.map((option) => (
-                          <MenuItem key={option.value} value={option.value}>
-                            {option.label}
-                          </MenuItem>
-                        ))}
-                      </Select>
-                    </FormControl>
+                    <Box sx={{ p: 2, bgcolor: "#f5f5f5", borderRadius: 2 }}>
+                      <Typography variant="body2" color="text.secondary">
+                        Category will be assigned automatically by AI after you submit this feedback.
+                      </Typography>
+                    </Box>
                   ) : (
                     <Box sx={{ p: 2, bgcolor: "#f5f5f5", borderRadius: 2 }}>
                       <Chip

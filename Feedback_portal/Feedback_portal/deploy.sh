@@ -30,7 +30,7 @@ echo "Creating feedback-api function..."
 aws --endpoint-url=http://127.0.0.1:4566 lambda create-function --function-name feedback-api --runtime provided.al2 --handler bootstrap --zip-file fileb://api.zip --role arn:aws:iam::000000000000:role/lambda-role
 
 echo "Configuring feedback-api..."
-aws --endpoint-url=http://127.0.0.1:4566 lambda update-function-configuration --function-name feedback-api --environment "Variables={DB_URL=postgres://postgres:postgres@postgres:5432/feedback_db?sslmode=disable,AWS_REGION=us-west-2,AWS_ENDPOINT_URL=http://localstack-main:4566,AWS_ACCESS_KEY_ID=test,AWS_SECRET_ACCESS_KEY=test,S3_BUCKET=feedback-attachments,SQS_URL=$SQS_URL}"
+aws --endpoint-url=http://127.0.0.1:4566 lambda update-function-configuration --function-name feedback-api --environment "Variables={DB_URL=postgres://postgres:postgres@postgres:5432/feedback_db?sslmode=disable,AWS_REGION=us-west-2,AWS_ENDPOINT_URL=http://localstack-main:4566,AWS_ACCESS_KEY_ID=test,AWS_SECRET_ACCESS_KEY=test,S3_BUCKET=feedback-attachments,SQS_URL=$SQS_URL,AI_CATEGORIZER_URL=http://feedback-ollama:11434/v1/chat/completions,AI_CATEGORIZER_MODEL=llama3.1:8b}"
 
 # === Deploy feedback-router lambda ===
 echo ""

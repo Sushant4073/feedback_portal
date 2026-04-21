@@ -1,26 +1,49 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"feedback-portal/internal/config"
 	"feedback-portal/internal/db"
 	"feedback-portal/internal/models"
 	"feedback-portal/internal/repository"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
 	"time"
 
+	awsutils "feedback-portal/internal/aws_utils"
+
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/google/uuid"
-	awsutils "feedback-portal/internal/aws_utils"
 )
 
 var cfg config.Config
+
+var validFeedbackCategories = map[string]struct{}{
+	"DEFECT":      {},
+	"FEATURE":     {},
+	"ENHANCEMENT": {},
+	"OTHER":       {},
+}
+
+var defectKeywords = []string{
+	"bug", "error", "crash", "fail", "issue", "broken", "defect", "exception", "not working", "incorrect",
+}
+
+var featureKeywords = []string{
+	"new feature", "add", "support", "need", "request", "would like", "ability", "implement", "integration",
+}
+
+var enhancementKeywords = []string{
+	"improve", "enhance", "optimization", "optimize", "refactor", "usability", "performance", "better", "streamline",
+}
 
 func init() {
 	cfg = config.Load()
@@ -159,6 +182,7 @@ func createFeedback(ctx context.Context, req events.APIGatewayProxyRequest) (eve
 	f.Status = "OPEN"
 	f.VoteCount = 0
 	f.CommentCount = 0
+	f.Category = autoCategorizeFeedback(ctx, f)
 
 	if err := repository.CreateFeedback(f); err != nil {
 		body, _ := json.Marshal(map[string]string{"error": err.Error()})
@@ -174,6 +198,139 @@ func createFeedback(ctx context.Context, req events.APIGatewayProxyRequest) (eve
 		StatusCode: http.StatusOK,
 		Body:       string(body),
 	}, nil
+}
+
+func autoCategorizeFeedback(ctx context.Context, f models.Feedback) string {
+	if llmCategory, err := categorizeFeedbackWithLLM(ctx, f.Title, f.Description); err == nil {
+		return llmCategory
+	} else if !errors.Is(err, errLLMNotConfigured) {
+		log.Printf("AI categorization unavailable, using heuristic fallback: %v", err)
+	}
+
+	return categorizeFeedbackHeuristic(f.Title, f.Description)
+}
+
+var errLLMNotConfigured = errors.New("llm categorizer is not configured")
+
+func categorizeFeedbackWithLLM(ctx context.Context, title, description string) (string, error) {
+	if strings.TrimSpace(cfg.AICategorizerURL) == "" || strings.TrimSpace(cfg.AICategorizerModel) == "" {
+		return "", errLLMNotConfigured
+	}
+
+	type llmMessage struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	type llmRequest struct {
+		Model       string       `json:"model"`
+		Temperature float64      `json:"temperature"`
+		Messages    []llmMessage `json:"messages"`
+	}
+	type llmChoice struct {
+		Message llmMessage `json:"message"`
+	}
+	type llmResponse struct {
+		Choices []llmChoice `json:"choices"`
+	}
+
+	payload := llmRequest{
+		Model:       cfg.AICategorizerModel,
+		Temperature: 0,
+		Messages: []llmMessage{
+			{
+				Role:    "system",
+				Content: "Classify user feedback into exactly one category: DEFECT, FEATURE, ENHANCEMENT, or OTHER. Respond with only one of those values.",
+			},
+			{
+				Role:    "user",
+				Content: fmt.Sprintf("Title: %s\nDescription: %s", title, description),
+			},
+		},
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.AICategorizerURL, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if strings.TrimSpace(cfg.AICategorizerAPIKey) != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.AICategorizerAPIKey)
+	}
+
+	client := &http.Client{Timeout: 8 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("llm API status %d: %s", resp.StatusCode, truncateForLog(string(respBody), 250))
+	}
+
+	var parsed llmResponse
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return "", err
+	}
+	if len(parsed.Choices) == 0 {
+		return "", errors.New("llm API returned no choices")
+	}
+
+	if category, ok := normalizeCategory(parsed.Choices[0].Message.Content); ok {
+		return category, nil
+	}
+
+	return "", fmt.Errorf("llm returned unsupported category: %s", parsed.Choices[0].Message.Content)
+}
+
+func categorizeFeedbackHeuristic(title, description string) string {
+	text := strings.ToLower(strings.TrimSpace(title + " " + description))
+
+	if containsAny(text, defectKeywords) {
+		return "DEFECT"
+	}
+	if containsAny(text, featureKeywords) {
+		return "FEATURE"
+	}
+	if containsAny(text, enhancementKeywords) {
+		return "ENHANCEMENT"
+	}
+
+	return "OTHER"
+}
+
+func containsAny(text string, keywords []string) bool {
+	for _, keyword := range keywords {
+		if strings.Contains(text, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeCategory(category string) (string, bool) {
+	normalized := strings.ToUpper(strings.TrimSpace(category))
+	if _, ok := validFeedbackCategories[normalized]; ok {
+		return normalized, true
+	}
+	return "", false
+}
+
+func truncateForLog(value string, maxLen int) string {
+	if len(value) <= maxLen {
+		return value
+	}
+	return value[:maxLen] + "..."
 }
 
 func getFeedback(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
@@ -341,7 +498,7 @@ func deleteFeedback(ctx context.Context, req events.APIGatewayProxyRequest) (eve
 	body, _ := json.Marshal(map[string]string{"message": "deleted"})
 	return events.APIGatewayProxyResponse{
 		StatusCode: http.StatusOK,
-			Body:       string(body),
+		Body:       string(body),
 	}, nil
 }
 
@@ -355,7 +512,7 @@ func listComments(ctx context.Context, req events.APIGatewayProxyRequest) (event
 	body, _ := json.Marshal(comments)
 	return events.APIGatewayProxyResponse{
 		StatusCode: http.StatusOK,
-			Body:       string(body),
+		Body:       string(body),
 	}, nil
 }
 
@@ -636,7 +793,7 @@ func listAttachments(ctx context.Context, req events.APIGatewayProxyRequest) (ev
 	body, _ := json.Marshal(attachments)
 	return events.APIGatewayProxyResponse{
 		StatusCode: http.StatusOK,
-			Body:       string(body),
+		Body:       string(body),
 	}, nil
 }
 
@@ -832,7 +989,7 @@ func confirmAttachment(ctx context.Context, req events.APIGatewayProxyRequest) (
 	// Create attachment record in database
 	a := models.Attachment{
 		ID:         uuid.New().String(),
-			FeedbackID: reqBody.FeedbackID,
+		FeedbackID: reqBody.FeedbackID,
 		S3Key:      reqBody.S3Key,
 		FileName:   reqBody.FileName,
 	}
@@ -913,8 +1070,8 @@ func finalizeFeedback(ctx context.Context, req events.APIGatewayProxyRequest) (e
 
 	// Return success with attachment count
 	body, _ := json.Marshal(map[string]interface{}{
-		"message":        "Feedback finalized successfully. Jira ticket will be created.",
-		"feedback_id":    feedbackID,
+		"message":          "Feedback finalized successfully. Jira ticket will be created.",
+		"feedback_id":      feedbackID,
 		"attachment_count": len(attachments),
 	})
 	return events.APIGatewayProxyResponse{

@@ -40,6 +40,17 @@ services:
       - "/var/run/docker.sock:/var/run/docker.sock"
       - localstack_data:/var/lib/localstack
 
+  # Local LLM for feedback auto-categorization
+  ollama:
+    image: ollama/ollama:latest
+    container_name: feedback-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   localstack_data:
+  ollama_data:

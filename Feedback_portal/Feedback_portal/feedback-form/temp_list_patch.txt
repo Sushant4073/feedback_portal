@@ -1,0 +1,111 @@
+                      <Stack
+                        spacing={2}
+                        alignItems={{ xs: "flex-start", sm: "center" }}
+                        sx={{ minWidth: { sm: 130 } }}
+                      >
+                        {/* Vote Button */}
+                        <Box
+                          sx={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 0.5,
+                          }}
+                        >
+                          <Tooltip
+                            title={isVoted ? "Remove vote" : "Vote"}
+                            arrow
+                          >
+                            <IconButton
+                              onClick={(e) => handleVoteToggle(e, feedback.id)}
+                              disabled={isVoting}
+                              sx={{
+                                p: 0.5,
+                                transition: "all 0.2s",
+                                color: isVoting ? "#e91e63" : "action.hover",
+                                "&:hover": {
+                                  transform: "scale(1.15)",
+                                  color: isVoting ? "#e91e63" : "#1976d2",
+                                },
+                              }}
+                              size="small"
+                            >
+                              {isVoted ? (
+                                <FavoriteIcon sx={{ fontSize: 24 }} />
+                              ) : (
+                                <FavoriteBorderIcon sx={{ fontSize: 24 }} />
+                              )}
+                            </IconButton>
+                          </Tooltip>
+                          <Typography
+                            fontWeight="700"
+                            sx={{
+                              fontSize: "1rem",
+                              color: isVoted ? "#e91e63" : "text.primary",
+                              ml: 0.5,
+                            }}
+                          >
+                            {feedback.vote_count || 0}
+                          </Typography>
+                        </Box>
+
+                        {/* Comment Count - Clickable to View Details */}
+                        <Box
+                          sx={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 0.5,
+                          }}
+                        >
+                          <Tooltip title="View Details" arrow>
+                            <IconButton
+                              onClick={() => handleClickFeedback(feedback.id)}
+                              sx={{
+                                p: 0.5,
+                                transition: "all 0.2s",
+                                color: "#1976d2",
+                                "&:hover": {
+                                  color: "#1565c0",
+                                  transform: "scale(1.15)",
+                                },
+                              }}
+                              size="small"
+                            >
+                              <ChatBubbleOutline sx={{ fontSize: 24 }} />
+                            </IconButton>
+                          </Tooltip>
+                          <Typography
+                            fontWeight="700"
+                            sx={{
+                              fontSize: "1rem",
+                              color: "#1976d2",
+                              ml: 0.5,
+                            }}
+                          >
+                            {feedback.comment_count || 0}
+                          </Typography>
+                        </Box>
+
+                        {/* View Details Button */}
+                        <Box>
+                          <Button
+                            variant="outlined"
+                            size="small"
+                            onClick={() => handleClickFeedback(feedback.id)}
+                            startIcon={<ArrowForwardIcon />}
+                            sx={{
+                              borderRadius: 2,
+                              fontWeight: 600,
+                              borderColor: "#1976d2",
+                              color: "#1976d2",
+                              "&:hover": {
+                                borderColor: "#1565c0",
+                                color: "#1565c0",
+                                transform: "scale(1.05)",
+                                bgcolor: "transparent",
+                              },
+                            }}
+                          >
+                            View
+                          </Button>
+                        </Box>
+                      </Stack>

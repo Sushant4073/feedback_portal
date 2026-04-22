@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	awsutils "feedback-portal/internal/aws_utils"
 	"feedback-portal/internal/config"
+	"feedback-portal/internal/aws_utils"
 	"feedback-portal/internal/db"
 	"feedback-portal/internal/models"
 	"feedback-portal/internal/repository"
@@ -129,8 +129,8 @@ func routeToJira(e models.FeedbackEvent) error {
 				"project": map[string]string{
 					"key": cfg.JiraProjectKey,
 				},
-				"summary":     e.Feedback.Title,
-				"description": buildJiraDescription(e.Feedback),
+				"summary":       e.Feedback.Title,
+				"description":    buildJiraDescription(e.Feedback),
 				"issuetype": map[string]string{
 					"name": getJiraIssueType(e.Feedback.Category),
 				},
@@ -255,39 +255,39 @@ func syncJiraStatus(feedbackID, jiraIssueID string, e models.FeedbackEvent) erro
 
 	client := &http.Client{Timeout: 30 * time.Second}
 
-	url := fmt.Sprintf("%s/rest/api/2/issue/%s/transitions", cfg.JiraBaseURL, jiraIssueID)
+		url := fmt.Sprintf("%s/rest/api/2/issue/%s/transitions", cfg.JiraBaseURL, jiraIssueID)
 
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(jsonPayload))
-	if err != nil {
-		return err
-	}
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(jsonPayload))
+		if err != nil {
+			return err
+		}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+cfg.JiraAPIToken)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+cfg.JiraAPIToken)
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode >= 400 {
+			body, _ := io.ReadAll(resp.Body)
+			log.Printf(
+				"Failed to transition Jira issue (status %d): %s",
+				resp.StatusCode,
+				string(body),
+			)
+		}
+
 		log.Printf(
-			"Failed to transition Jira issue (status %d): %s",
-			resp.StatusCode,
-			string(body),
+			"Synced status %s -> Jira: %s for FeedbackID: %s",
+			e.Feedback.Status,
+			jiraStatus,
+			feedbackID,
 		)
-	}
 
-	log.Printf(
-		"Synced status %s -> Jira: %s for FeedbackID: %s",
-		e.Feedback.Status,
-		jiraStatus,
-		feedbackID,
-	)
-
-	return nil
+		return nil
 }
 
 func buildJiraDescription(f models.Feedback) string {

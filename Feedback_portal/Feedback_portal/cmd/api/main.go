@@ -189,15 +189,148 @@ func createFeedback(ctx context.Context, req events.APIGatewayProxyRequest) (eve
 		return events.APIGatewayProxyResponse{StatusCode: http.StatusInternalServerError, Body: string(body)}, nil
 	}
 
-	// Don't publish FEEDBACK_CREATED event here
-	// Instead, the UI will call finalizeFeedback after uploading all attachments
-	// This ensures all attachments are ready before creating the Jira ticket
+	// Find similar existing feedback using LLM (best-effort — never blocks creation).
+	var similar []similarFeedbackItem
+	if existing, err := repository.GetRecentOpenFeedbackByTenant(f.TenantID, f.ID, 15); err == nil && len(existing) > 0 {
+		similar = findSimilarFeedbackWithLLM(ctx, f.Title, f.Description, existing)
+	}
 
-	body, _ := json.Marshal(f)
+	// Build the response: keep all Feedback fields at top level and append similar_feedback.
+	respMap := map[string]interface{}{}
+	feedbackBytes, _ := json.Marshal(f)
+	json.Unmarshal(feedbackBytes, &respMap) //nolint:errcheck — marshal of known struct cannot fail
+	if len(similar) > 0 {
+		respMap["similar_feedback"] = similar
+	}
+
+	body, _ := json.Marshal(respMap)
 	return events.APIGatewayProxyResponse{
 		StatusCode: http.StatusOK,
 		Body:       string(body),
 	}, nil
+}
+
+// similarFeedbackItem represents a potentially duplicate feedback item returned to the caller.
+type similarFeedbackItem struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+}
+
+// findSimilarFeedbackWithLLM asks the LLM to identify which of the existing feedback items
+// are semantically similar or duplicate to the new feedback. Returns nil on any error so the
+// create flow is never blocked.
+func findSimilarFeedbackWithLLM(ctx context.Context, newTitle, newDescription string, existing []models.Feedback) []similarFeedbackItem {
+	if strings.TrimSpace(cfg.AICategorizerURL) == "" || strings.TrimSpace(cfg.AICategorizerModel) == "" {
+		return nil
+	}
+
+	// Build a numbered list of existing items for the prompt.
+	var listBuilder strings.Builder
+	for i, f := range existing {
+		desc := f.Description
+		if len(desc) > 120 {
+			desc = desc[:120] + "..."
+		}
+		listBuilder.WriteString(fmt.Sprintf("%d. [%s] Title: %s | Description: %s\n", i+1, f.ID, f.Title, desc))
+	}
+
+	type llmMessage struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	type llmRequest struct {
+		Model       string       `json:"model"`
+		Temperature float64      `json:"temperature"`
+		Messages    []llmMessage `json:"messages"`
+	}
+	type llmChoice struct {
+		Message llmMessage `json:"message"`
+	}
+	type llmResponse struct {
+		Choices []llmChoice `json:"choices"`
+	}
+
+	systemPrompt := `You are a feedback deduplication assistant. Given new user feedback and a list of existing items, identify which existing items are semantically similar or duplicate. Return ONLY a valid JSON array of the IDs of similar items. Example: ["abc-123", "def-456"]. Return [] if nothing is similar. Do not include any explanation or extra text.`
+	userContent := fmt.Sprintf(
+		"New feedback:\nTitle: %s\nDescription: %s\n\nExisting feedback:\n%s",
+		newTitle, newDescription, listBuilder.String(),
+	)
+
+	payload := llmRequest{
+		Model:       cfg.AICategorizerModel,
+		Temperature: 0,
+		Messages: []llmMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userContent},
+		},
+	}
+
+	reqBody, err := json.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.AICategorizerURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if strings.TrimSpace(cfg.AICategorizerAPIKey) != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+cfg.AICategorizerAPIKey)
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		log.Printf("findSimilarFeedback: LLM request failed: %v", err)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("findSimilarFeedback: LLM API status %d: %s", resp.StatusCode, truncateForLog(string(respBody), 200))
+		return nil
+	}
+
+	var parsed llmResponse
+	if err := json.Unmarshal(respBody, &parsed); err != nil || len(parsed.Choices) == 0 {
+		return nil
+	}
+
+	content := strings.TrimSpace(parsed.Choices[0].Message.Content)
+
+	// Extract JSON array — LLMs sometimes prepend/append explanation text.
+	start := strings.Index(content, "[")
+	end := strings.LastIndex(content, "]")
+	if start == -1 || end == -1 || end <= start {
+		return nil
+	}
+	content = content[start : end+1]
+
+	var similarIDs []string
+	if err := json.Unmarshal([]byte(content), &similarIDs); err != nil {
+		log.Printf("findSimilarFeedback: failed to parse LLM JSON response: %v, raw: %s", err, content)
+		return nil
+	}
+
+	// Map id → feedback for O(1) lookup.
+	idMap := make(map[string]models.Feedback, len(existing))
+	for _, f := range existing {
+		idMap[f.ID] = f
+	}
+
+	var result []similarFeedbackItem
+	for _, sid := range similarIDs {
+		if f, ok := idMap[sid]; ok {
+			result = append(result, similarFeedbackItem{ID: f.ID, Title: f.Title})
+		}
+	}
+	return result
 }
 
 func autoCategorizeFeedback(ctx context.Context, f models.Feedback) string {

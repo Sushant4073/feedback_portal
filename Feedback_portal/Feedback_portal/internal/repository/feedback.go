@@ -167,6 +167,33 @@ func DecrementCommentCount(id string) error {
 	return err
 }
 
+// GetRecentOpenFeedbackByTenant returns up to `limit` non-resolved/closed feedback items
+// for the given tenant, excluding the item with id `excludeID`. Used for duplicate detection.
+func GetRecentOpenFeedbackByTenant(tenantID string, excludeID string, limit int) ([]models.Feedback, error) {
+	query := `
+	SELECT id, title, description
+	FROM feedback
+	WHERE tenant_id=$1 AND id != $2 AND status NOT IN ('RESOLVED', 'CLOSED')
+	ORDER BY created_at DESC
+	LIMIT $3
+	`
+	rows, err := db.DB.Query(query, tenantID, excludeID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var feedbacks []models.Feedback
+	for rows.Next() {
+		var f models.Feedback
+		if err := rows.Scan(&f.ID, &f.Title, &f.Description); err != nil {
+			return nil, err
+		}
+		feedbacks = append(feedbacks, f)
+	}
+	return feedbacks, nil
+}
+
 // Comment operations
 func CreateComment(c models.Comment) error {
 	query := `

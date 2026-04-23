@@ -138,6 +138,8 @@ const FeedbackDetails = ({ mode = "view" }) => {
   const [attachments, setAttachments] = useState([]);
   // Store pending files for upload after feedback creation
   const [pendingFiles, setPendingFiles] = useState([]);
+  const [similarFeedbacks, setSimilarFeedbacks] = useState([]);
+  const [pendingFeedbackResult, setPendingFeedbackResult] = useState(null);
 
   const isNewFeedback = mode === "create";
   const tenantId = "default-tenant";
@@ -235,6 +237,59 @@ const FeedbackDetails = ({ mode = "view" }) => {
     }
   };
 
+  // Uploads pending files and finalizes the feedback (triggers Jira ticket creation).
+  const uploadAndFinalize = async (result) => {
+    const feedbackId = result.id;
+
+    if (pendingFiles.length > 0) {
+      let uploadErrors = [];
+      for (let i = 0; i < pendingFiles.length; i++) {
+        const pendingFile = pendingFiles[i];
+        try {
+          const { upload_url, s3_key, file_name } = await getPresignedUploadURL(
+            feedbackId,
+            tenantId,
+            pendingFile.name
+          );
+          await uploadFileDirectly(upload_url, pendingFile);
+          await confirmAttachmentUpload(feedbackId, s3_key, file_name);
+        } catch (uploadErr) {
+          console.error(`Failed to upload ${pendingFile.name}:`, uploadErr);
+          uploadErrors.push(pendingFile.name);
+        }
+      }
+      if (uploadErrors.length > 0) {
+        console.warn(`Some files failed to upload: ${uploadErrors.join(', ')}`);
+      }
+    }
+
+    await finalizeFeedback(feedbackId);
+    setSubmitting(false);
+    alert("Feedback created successfully! Jira ticket will be created with all attachments.");
+    setTimeout(() => {
+      window.location.href = "/";
+    }, 100);
+  };
+
+  const handleContinueAnyway = async () => {
+    setSubmitting(true);
+    setSimilarFeedbacks([]);
+    try {
+      await uploadAndFinalize(pendingFeedbackResult);
+      setPendingFeedbackResult(null);
+    } catch (err) {
+      console.error("Error finalizing feedback:", err);
+      setError(err.message || "Failed to finalize feedback");
+      setSubmitting(false);
+    }
+  };
+
+  const handleCancelAfterSimilar = () => {
+    setSimilarFeedbacks([]);
+    setPendingFeedbackResult(null);
+    navigate("/");
+  };
+
   const handleCreateFeedback = async () => {
     setSubmitting(true);
     setError(null);
@@ -248,46 +303,18 @@ const FeedbackDetails = ({ mode = "view" }) => {
         user_id: "default-user",
       });
 
-      // Step 2: Upload all pending files
-      if (pendingFiles.length > 0) {
-        const feedbackId = result.id;
-        let uploadErrors = [];
-
-        // Upload each pending file
-        for (let i = 0; i < pendingFiles.length; i++) {
-          const pendingFile = pendingFiles[i];
-          try {
-            // Step 2a: Get presigned URL
-            const { upload_url, s3_key, file_name } = await getPresignedUploadURL(
-              feedbackId,
-              tenantId,
-              pendingFile.name
-            );
-
-            // Step 2b: Upload to S3
-            await uploadFileDirectly(upload_url, pendingFile);
-
-            // Step 2c: Confirm upload (create DB record)
-            await confirmAttachmentUpload(feedbackId, s3_key, file_name);
-          } catch (uploadErr) {
-            console.error(`Failed to upload ${pendingFile.name}:`, uploadErr);
-            uploadErrors.push(pendingFile.name);
-          }
-        }
-
-        if (uploadErrors.length > 0) {
-          console.warn(`Some files failed to upload: ${uploadErrors.join(', ')}`);
-        }
+      // Step 2: Check if the LLM detected similar/duplicate feedback.
+      // If so, pause and let the user decide before finalizing.
+      if (result.similar_feedback && result.similar_feedback.length > 0) {
+        setSimilarFeedbacks(result.similar_feedback);
+        setPendingFeedbackResult(result);
+        setSubmitting(false);
+        return;
+      }
       }
 
-      // Step 3: Finalize - send event to create Jira ticket with attachments ready
-      await finalizeFeedback(result.id);
-
-      setSubmitting(false);
-      alert("Feedback created successfully! Jira ticket will be created with all attachments.");
-      setTimeout(() => {
-        window.location.href = "/";
-      }, 100);
+      // Step 3: Upload files + finalize (triggers Jira ticket creation).
+      await uploadAndFinalize(result);
     } catch (err) {
       console.error("Error creating feedback:", err);
       setError(err.message || "Failed to create feedback");
@@ -508,6 +535,57 @@ const FeedbackDetails = ({ mode = "view" }) => {
             {error && (
               <Alert severity="error" sx={{ mb: 3, borderRadius: 2 }} onClose={() => setError(null)}>
                 {error}
+              </Alert>
+            )}
+
+            {/* Similar / Duplicate Feedback Warning */}
+            {similarFeedbacks.length > 0 && (
+              <Alert
+                severity="warning"
+                sx={{ mb: 2, borderRadius: 2 }}
+                icon={false}
+              >
+                <Typography variant="subtitle2" fontWeight="700" mb={0.5}>
+                  Similar Feedback Already Exists
+                </Typography>
+                <Typography variant="body2" mb={1.5}>
+                  AI detected that your feedback may be similar to the following existing items. You can view them or continue creating your new feedback anyway.
+                </Typography>
+                <Stack spacing={1} mb={2}>
+                  {similarFeedbacks.map((item) => (
+                    <Button
+                      key={item.id}
+                      variant="outlined"
+                      size="small"
+                      color="warning"
+                      onClick={() => navigate(`/feedback/${item.id}`)}
+                      sx={{ justifyContent: "flex-start", textAlign: "left", borderRadius: 2, textTransform: "none" }}
+                    >
+                      {item.title}
+                    </Button>
+                  ))}
+                </Stack>
+                <Stack direction="row" spacing={2}>
+                  <Button
+                    variant="contained"
+                    color="warning"
+                    size="small"
+                    onClick={handleContinueAnyway}
+                    disabled={submitting}
+                    sx={{ borderRadius: 2, fontWeight: 600 }}
+                  >
+                    {submitting ? "Submitting..." : "Continue Anyway"}
+                  </Button>
+                  <Button
+                    variant="outlined"
+                    color="warning"
+                    size="small"
+                    onClick={handleCancelAfterSimilar}
+                    sx={{ borderRadius: 2 }}
+                  >
+                    Go Back
+                  </Button>
+                </Stack>
               </Alert>
             )}
 
@@ -1091,7 +1169,7 @@ const FeedbackDetails = ({ mode = "view" }) => {
                     <Button
                       variant="contained"
                       onClick={handleCreateFeedback}
-                      disabled={submitting}
+                      disabled={submitting || similarFeedbacks.length > 0}
                       fullWidth
                       size="large"
                       startIcon={submitting ? <CircularProgress size={20} /> : null}

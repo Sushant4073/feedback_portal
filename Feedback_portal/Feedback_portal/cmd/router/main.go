@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
+	awsutils "feedback-portal/internal/aws_utils"
 	"feedback-portal/internal/config"
-	"feedback-portal/internal/aws_utils"
 	"feedback-portal/internal/db"
 	"feedback-portal/internal/models"
 	"feedback-portal/internal/repository"
@@ -124,13 +124,24 @@ func routeToJira(e models.FeedbackEvent) error {
 			e.Feedback.Category,
 		)
 
+		description := buildJiraDescription(e.Feedback)
+		if cfg.AIJiraDescriptionEnrichment {
+			if enriched, err := enrichJiraDescriptionWithLLM(context.Background(), e.Feedback); err == nil {
+				description = enriched
+			} else {
+				log.Printf("Jira description enrichment unavailable, using fallback formatter: %v", err)
+			}
+		} else {
+			log.Printf("Jira description enrichment disabled via AI_JIRA_DESCRIPTION_ENRICHMENT")
+		}
+
 		jiraPayload := map[string]interface{}{
 			"fields": map[string]interface{}{
 				"project": map[string]string{
 					"key": cfg.JiraProjectKey,
 				},
-				"summary":       e.Feedback.Title,
-				"description":    buildJiraDescription(e.Feedback),
+				"summary":     e.Feedback.Title,
+				"description": description,
 				"issuetype": map[string]string{
 					"name": getJiraIssueType(e.Feedback.Category),
 				},
@@ -255,39 +266,39 @@ func syncJiraStatus(feedbackID, jiraIssueID string, e models.FeedbackEvent) erro
 
 	client := &http.Client{Timeout: 30 * time.Second}
 
-		url := fmt.Sprintf("%s/rest/api/2/issue/%s/transitions", cfg.JiraBaseURL, jiraIssueID)
+	url := fmt.Sprintf("%s/rest/api/2/issue/%s/transitions", cfg.JiraBaseURL, jiraIssueID)
 
-		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(jsonPayload))
-		if err != nil {
-			return err
-		}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(jsonPayload))
+	if err != nil {
+		return err
+	}
 
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+cfg.JiraAPIToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+cfg.JiraAPIToken)
 
-		resp, err := client.Do(req)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = resp.Body.Close() }()
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
 
-		if resp.StatusCode >= 400 {
-			body, _ := io.ReadAll(resp.Body)
-			log.Printf(
-				"Failed to transition Jira issue (status %d): %s",
-				resp.StatusCode,
-				string(body),
-			)
-		}
-
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
 		log.Printf(
-			"Synced status %s -> Jira: %s for FeedbackID: %s",
-			e.Feedback.Status,
-			jiraStatus,
-			feedbackID,
+			"Failed to transition Jira issue (status %d): %s",
+			resp.StatusCode,
+			string(body),
 		)
+	}
 
-		return nil
+	log.Printf(
+		"Synced status %s -> Jira: %s for FeedbackID: %s",
+		e.Feedback.Status,
+		jiraStatus,
+		feedbackID,
+	)
+
+	return nil
 }
 
 func buildJiraDescription(f models.Feedback) string {
@@ -313,6 +324,101 @@ func buildJiraDescription(f models.Feedback) string {
 	}
 
 	return desc.String()
+}
+
+var errLLMNotConfigured = fmt.Errorf("llm enricher is not configured")
+
+func enrichJiraDescriptionWithLLM(ctx context.Context, f models.Feedback) (string, error) {
+	if strings.TrimSpace(cfg.AICategorizerURL) == "" || strings.TrimSpace(cfg.AICategorizerModel) == "" {
+		return "", errLLMNotConfigured
+	}
+
+	type llmMessage struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	type llmRequest struct {
+		Model       string       `json:"model"`
+		Temperature float64      `json:"temperature"`
+		Messages    []llmMessage `json:"messages"`
+	}
+	type llmChoice struct {
+		Message llmMessage `json:"message"`
+	}
+	type llmResponse struct {
+		Choices []llmChoice `json:"choices"`
+	}
+
+	systemPrompt := "You are a Jira ticket writer. Produce concise, actionable issue descriptions for engineering teams. Output plain text only."
+	userPrompt := fmt.Sprintf(
+		"Create a structured Jira description for this feedback. Keep it concise and clear. Include sections with these exact headings: Context, User Report, Business Impact, Technical Notes, Suggested Next Steps. If category is DEFECT, include a Steps to Reproduce subsection inside User Report with numbered steps. If data is missing, say 'Not provided'.\n\nFeedback:\nTitle: %s\nDescription: %s\nCategory: %s\nTenant: %s\nSubmitted By: %s",
+		f.Title,
+		f.Description,
+		f.Category,
+		f.TenantID,
+		f.UserID,
+	)
+
+	payload := llmRequest{
+		Model:       cfg.AICategorizerModel,
+		Temperature: 0,
+		Messages: []llmMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
+		},
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.AICategorizerURL, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if strings.TrimSpace(cfg.AICategorizerAPIKey) != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.AICategorizerAPIKey)
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("llm API status %d: %s", resp.StatusCode, truncateForLog(string(respBody), 250))
+	}
+
+	var parsed llmResponse
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return "", err
+	}
+	if len(parsed.Choices) == 0 {
+		return "", fmt.Errorf("llm API returned no choices")
+	}
+
+	enriched := strings.TrimSpace(parsed.Choices[0].Message.Content)
+	if enriched == "" {
+		return "", fmt.Errorf("llm returned empty description")
+	}
+
+	return enriched, nil
+}
+
+func truncateForLog(value string, maxLen int) string {
+	if len(value) <= maxLen {
+		return value
+	}
+	return value[:maxLen] + "..."
 }
 
 func getJiraIssueType(category string) string {

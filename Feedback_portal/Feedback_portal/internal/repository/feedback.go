@@ -171,9 +171,9 @@ func DecrementCommentCount(id string) error {
 // for the given tenant, excluding the item with id `excludeID`. Used for duplicate detection.
 func GetRecentOpenFeedbackByTenant(tenantID string, excludeID string, limit int) ([]models.Feedback, error) {
 	query := `
-	SELECT id, title, description
+	SELECT id, title, description, category, status
 	FROM feedback
-	WHERE tenant_id=$1 AND id != $2 AND status NOT IN ('RESOLVED', 'CLOSED')
+	WHERE tenant_id=$1 AND (id != $2 OR $2 = '') AND status NOT IN ('RESOLVED', 'CLOSED')
 	ORDER BY created_at DESC
 	LIMIT $3
 	`
@@ -186,9 +186,12 @@ func GetRecentOpenFeedbackByTenant(tenantID string, excludeID string, limit int)
 	var feedbacks []models.Feedback
 	for rows.Next() {
 		var f models.Feedback
-		if err := rows.Scan(&f.ID, &f.Title, &f.Description); err != nil {
+		var category, status string
+		if err := rows.Scan(&f.ID, &f.Title, &f.Description, &category, &status); err != nil {
 			return nil, err
 		}
+		f.Category = category
+		f.Status = status
 		feedbacks = append(feedbacks, f)
 	}
 	return feedbacks, nil
@@ -359,4 +362,13 @@ func MarkAttachmentUploadedToJira(attachmentID string) error {
 	`
 	_, err := db.DB.Exec(query, attachmentID)
 	return err
+}
+
+// CheckTitleMatch checks if a feedback with the same title already exists
+// Returns true if found, false otherwise
+func CheckTitleMatch(tenantID string, title string) (bool, error) {
+	var exists bool
+	query := `SELECT EXISTS(SELECT 1 FROM feedback WHERE tenant_id=$1 AND title=$2 AND status NOT IN ('RESOLVED', 'CLOSED'))`
+	err := db.DB.QueryRow(query, tenantID, title).Scan(&exists)
+	return exists, err
 }

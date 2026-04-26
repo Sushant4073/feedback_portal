@@ -30,7 +30,7 @@ echo "Creating feedback-api function..."
 aws --endpoint-url=http://127.0.0.1:4566 lambda create-function --function-name feedback-api --runtime provided.al2 --handler bootstrap --zip-file fileb://api.zip --role arn:aws:iam::000000000000:role/lambda-role
 
 echo "Configuring feedback-api..."
-aws --endpoint-url=http://127.0.0.1:4566 lambda update-function-configuration --function-name feedback-api --timeout 15 --memory-size 256 --environment "Variables={DB_URL=postgres://postgres:postgres@postgres:5432/feedback_db?sslmode=disable,AWS_REGION=us-west-2,AWS_ENDPOINT_URL=http://localstack-main:4566,AWS_ACCESS_KEY_ID=test,AWS_SECRET_ACCESS_KEY=test,S3_BUCKET=feedback-attachments,SQS_URL=$SQS_URL,AI_CATEGORIZER_URL=http://feedback-ollama:11434/v1/chat/completions,AI_CATEGORIZER_MODEL=llama3.1:8b}"
+aws --endpoint-url=http://127.0.0.1:4566 lambda update-function-configuration --function-name feedback-api --timeout 90 --memory-size 256 --environment "Variables={DB_URL=postgres://postgres:postgres@postgres:5432/feedback_db?sslmode=disable,AWS_REGION=us-west-2,AWS_ENDPOINT_URL=http://localstack-main:4566,AWS_ACCESS_KEY_ID=test,AWS_SECRET_ACCESS_KEY=test,S3_BUCKET=feedback-attachments,SQS_URL=$SQS_URL,AI_CATEGORIZER_URL=http://host.docker.internal:11434/v1/chat/completions,AI_CATEGORIZER_MODEL=llama3.1:8b}"
 
 # === Deploy feedback-router lambda ===
 echo ""
@@ -49,7 +49,7 @@ echo "Creating feedback-router function..."
 aws --endpoint-url=http://127.0.0.1:4566 lambda create-function --function-name feedback-router --runtime provided.al2 --handler bootstrap --zip-file fileb://router.zip --role arn:aws:iam::000000000000:role/lambda-role
 
 echo "Configuring feedback-router..."
-aws --endpoint-url=http://127.0.0.1:4566 lambda update-function-configuration --function-name feedback-router --timeout 30 --memory-size 512 --environment "Variables={AWS_ENDPOINT_URL=http://localstack-main:4566,AWS_REGION=us-west-2,DB_URL=postgres://postgres:postgres@postgres:5432/feedback_db?sslmode=disable,S3_BUCKET=feedback-attachments,AI_CATEGORIZER_URL=http://feedback-ollama:11434/v1/chat/completions,AI_CATEGORIZER_MODEL=llama3.1:8b,AI_JIRA_DESCRIPTION_ENRICHMENT=true,JIRA_BASE_URL=${JIRA_BASE_URL},JIRA_PAT=${JIRA_PAT},JIRA_PROJECT_KEY=${JIRA_PROJECT_KEY}}"
+aws --endpoint-url=http://127.0.0.1:4566 lambda update-function-configuration --function-name feedback-router --timeout 45 --memory-size 512 --environment "Variables={AWS_ENDPOINT_URL=http://localstack-main:4566,AWS_REGION=us-west-2,DB_URL=postgres://postgres:postgres@postgres:5432/feedback_db?sslmode=disable,S3_BUCKET=feedback-attachments,AI_CATEGORIZER_URL=http://host.docker.internal:11434/v1/chat/completions,AI_CATEGORIZER_MODEL=llama3.1:8b,AI_JIRA_DESCRIPTION_ENRICHMENT=true}"
 
 # === Create S3 bucket ===
 echo ""

@@ -124,15 +124,37 @@ func routeToJira(e models.FeedbackEvent) error {
 			e.Feedback.Category,
 		)
 
+		log.Printf("AI Enhancement Configuration: AI_JIRA_DESCRIPTION_ENRICHMENT=%v", cfg.AIJiraDescriptionEnrichment)
+		log.Printf("AI Configuration: URL=%s, Model=%s, HasAPIKey=%v",
+			cfg.AICategorizerURL,
+			cfg.AICategorizerModel,
+			strings.TrimSpace(cfg.AICategorizerAPIKey) != "")
+
+		// Start with the base description
 		description := buildJiraDescription(e.Feedback)
+
 		if cfg.AIJiraDescriptionEnrichment {
-			if enriched, err := enrichJiraDescriptionWithLLM(context.Background(), e.Feedback); err == nil {
-				description = enriched
+			log.Printf("AI Jira description enrichment is ENABLED - attempting LLM enrichment")
+
+			// Add timeout context for LLM enrichment - longer timeout for better reliability
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			defer cancel()
+
+			enriched, err := enrichJiraDescriptionWithLLM(ctx, e.Feedback)
+
+			if err != nil {
+				log.Printf("enrichJiraDescription: FAILED! Error: %v", err)
+				log.Printf("enrichJiraDescription: Falling back to base description")
+			} else if enriched == "" {
+				log.Printf("enrichJiraDescription: WARNING! LLM returned empty string")
+				log.Printf("enrichJiraDescription: Falling back to base description")
 			} else {
-				log.Printf("Jira description enrichment unavailable, using fallback formatter: %v", err)
+				log.Printf("enrichJiraDescription: SUCCESS! Enriched description length: %d chars", len(enriched))
+				log.Printf("enrichJiraDescription: First 200 chars of enriched: %s", truncateForLog(enriched, 200))
+				description = enriched
 			}
 		} else {
-			log.Printf("Jira description enrichment disabled via AI_JIRA_DESCRIPTION_ENRICHMENT")
+			log.Printf("AI Jira description enrichment is DISABLED via AI_JIRA_DESCRIPTION_ENRICHMENT flag")
 		}
 
 		jiraPayload := map[string]interface{}{
@@ -154,7 +176,7 @@ func routeToJira(e models.FeedbackEvent) error {
 		}
 
 		client := &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: 60 * time.Second,
 		}
 
 		url := fmt.Sprintf("%s/rest/api/2/issue", cfg.JiraBaseURL)
@@ -264,7 +286,7 @@ func syncJiraStatus(feedbackID, jiraIssueID string, e models.FeedbackEvent) erro
 		return fmt.Errorf("failed to marshal transition payload: %w", err)
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 60 * time.Second}
 
 	url := fmt.Sprintf("%s/rest/api/2/issue/%s/transitions", cfg.JiraBaseURL, jiraIssueID)
 
@@ -305,11 +327,16 @@ func buildJiraDescription(f models.Feedback) string {
 
 	var desc strings.Builder
 
+	// Build a more structured description even in fallback mode
+	desc.WriteString("*User Report*\n\n")
+
 	if f.Description != "" {
 		desc.WriteString(f.Description)
+	} else {
+		desc.WriteString("No description provided by the user.")
 	}
 
-	desc.WriteString("\n\n---\nFeedback Details:\n")
+	desc.WriteString("\n\n---\n*Feedback Details*\n\n")
 
 	if f.Category != "" {
 		fmt.Fprintf(&desc, "Category: %s\n", f.Category)
@@ -329,9 +356,22 @@ func buildJiraDescription(f models.Feedback) string {
 var errLLMNotConfigured = fmt.Errorf("llm enricher is not configured")
 
 func enrichJiraDescriptionWithLLM(ctx context.Context, f models.Feedback) (string, error) {
-	if strings.TrimSpace(cfg.AICategorizerURL) == "" || strings.TrimSpace(cfg.AICategorizerModel) == "" {
-		return "", errLLMNotConfigured
+	// Validate AI configuration
+	aiURL := strings.TrimSpace(cfg.AICategorizerURL)
+	aiModel := strings.TrimSpace(cfg.AICategorizerModel)
+
+	if aiURL == "" {
+		log.Printf("enrichJiraDescription: CRITICAL - AI_CATEGORIZER_URL is empty!")
+		return "", fmt.Errorf("AI_CATEGORIZER_URL not configured")
 	}
+
+	if aiModel == "" {
+		log.Printf("enrichJiraDescription: CRITICAL - AI_CATEGORIZER_MODEL is empty!")
+		return "", fmt.Errorf("AI_CATEGORIZER_MODEL not configured")
+	}
+
+	log.Printf("enrichJiraDescription: Starting enrichment for feedback %s", f.ID)
+	log.Printf("enrichJiraDescription: Using URL=%s, Model=%s", aiURL, aiModel)
 
 	type llmMessage struct {
 		Role    string `json:"role"`
@@ -370,11 +410,13 @@ func enrichJiraDescriptionWithLLM(ctx context.Context, f models.Feedback) (strin
 
 	body, err := json.Marshal(payload)
 	if err != nil {
+		log.Printf("enrichJiraDescription: failed to marshal request: %v", err)
 		return "", err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.AICategorizerURL, bytes.NewReader(body))
 	if err != nil {
+		log.Printf("enrichJiraDescription: failed to create request: %v", err)
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -382,17 +424,23 @@ func enrichJiraDescriptionWithLLM(ctx context.Context, f models.Feedback) (strin
 		req.Header.Set("Authorization", "Bearer "+cfg.AICategorizerAPIKey)
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	log.Printf("enrichJiraDescription: Sending request to AI at %s", cfg.AICategorizerURL)
+
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		log.Printf("enrichJiraDescription: HTTP request failed: %v", err)
+		return "", fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		log.Printf("enrichJiraDescription: failed to read response: %v", err)
 		return "", err
 	}
+
+	log.Printf("enrichJiraDescription: AI response status %d, body: %s", resp.StatusCode, truncateForLog(string(respBody), 500))
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("llm API status %d: %s", resp.StatusCode, truncateForLog(string(respBody), 250))
@@ -400,17 +448,21 @@ func enrichJiraDescriptionWithLLM(ctx context.Context, f models.Feedback) (strin
 
 	var parsed llmResponse
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return "", err
+		log.Printf("enrichJiraDescription: failed to unmarshal response: %v", err)
+		return "", fmt.Errorf("failed to parse LLM response: %w", err)
 	}
 	if len(parsed.Choices) == 0 {
+		log.Printf("enrichJiraDescription: LLM returned no choices")
 		return "", fmt.Errorf("llm API returned no choices")
 	}
 
 	enriched := strings.TrimSpace(parsed.Choices[0].Message.Content)
 	if enriched == "" {
+		log.Printf("enrichJiraDescription: LLM returned empty description")
 		return "", fmt.Errorf("llm returned empty description")
 	}
 
+	log.Printf("enrichJiraDescription: Successfully enriched description (length: %d chars)", len(enriched))
 	return enriched, nil
 }
 
@@ -490,7 +542,7 @@ func uploadAttachmentsToJira(feedbackID, jiraIssueKey string, cfg config.Config)
 
 	// Create HTTP client for Jira API
 	client := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 60 * time.Second,
 	}
 
 	// Download files from S3 and upload to Jira

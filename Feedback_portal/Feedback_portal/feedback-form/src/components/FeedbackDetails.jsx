@@ -241,10 +241,9 @@ const FeedbackDetails = ({ mode = "view" }) => {
   const uploadAndFinalize = async (result) => {
     const feedbackId = result.id;
 
+    // Parallelize file uploads - upload all files concurrently
     if (pendingFiles.length > 0) {
-      let uploadErrors = [];
-      for (let i = 0; i < pendingFiles.length; i++) {
-        const pendingFile = pendingFiles[i];
+      const uploadPromises = pendingFiles.map(async (pendingFile) => {
         try {
           const { upload_url, s3_key, file_name } = await getPresignedUploadURL(
             feedbackId,
@@ -253,19 +252,25 @@ const FeedbackDetails = ({ mode = "view" }) => {
           );
           await uploadFileDirectly(upload_url, pendingFile);
           await confirmAttachmentUpload(feedbackId, s3_key, file_name);
+          return { success: true, fileName: pendingFile.name };
         } catch (uploadErr) {
           console.error(`Failed to upload ${pendingFile.name}:`, uploadErr);
-          uploadErrors.push(pendingFile.name);
+          return { success: false, fileName: pendingFile.name };
         }
-      }
+      });
+
+      const results = await Promise.all(uploadPromises);
+      const uploadErrors = results.filter(r => !r.success).map(r => r.fileName);
       if (uploadErrors.length > 0) {
         console.warn(`Some files failed to upload: ${uploadErrors.join(', ')}`);
       }
     }
 
+    // Finalize uploads before triggering Jira - ensures DB has attachment records
     await finalizeFeedback(feedbackId);
+
     setSubmitting(false);
-    alert("Feedback created successfully! Jira ticket will be created with all attachments.");
+    alert("Feedback created successfully! Jira ticket is being created with all attachments.");
     setTimeout(() => {
       window.location.href = "/";
     }, 100);
@@ -274,8 +279,17 @@ const FeedbackDetails = ({ mode = "view" }) => {
   const handleContinueAnyway = async () => {
     setSubmitting(true);
     setSimilarFeedbacks([]);
+
     try {
-      await uploadAndFinalize(pendingFeedbackResult);
+      console.log("Creating feedback after duplicate confirmation (bypassing duplicate check)...");
+      const result = await createFeedback({
+        title: formData.title,
+        description: formData.description,
+        tenant_id: "default-tenant",
+        user_id: "default-user",
+      }, true); // Pass true to bypass duplicate check
+
+      await uploadAndFinalize(result);
       setPendingFeedbackResult(null);
     } catch (err) {
       console.error("Error finalizing feedback:", err);
@@ -295,7 +309,7 @@ const FeedbackDetails = ({ mode = "view" }) => {
     setError(null);
 
     try {
-      // Step 1: Create the feedback (no event sent yet)
+      // Step 1: Create the feedback (duplicate check happens on server)
       const result = await createFeedback({
         title: formData.title,
         description: formData.description,
@@ -303,20 +317,26 @@ const FeedbackDetails = ({ mode = "view" }) => {
         user_id: "default-user",
       });
 
-      // Step 2: Check if the LLM detected similar/duplicate feedback.
-      // If so, pause and let the user decide before finalizing.
-      if (result.similar_feedback && result.similar_feedback.length > 0) {
-        setSimilarFeedbacks(result.similar_feedback);
-        setPendingFeedbackResult(result);
-        setSubmitting(false);
-        return;
-      }
-      }
-
-      // Step 3: Upload files + finalize (triggers Jira ticket creation).
+      // Step 2: Upload files + finalize (triggers Jira ticket creation).
       await uploadAndFinalize(result);
     } catch (err) {
       console.error("Error creating feedback:", err);
+
+      // Handle Conflict status (409) - duplicate feedback detected
+      const errorStr = err.message || "";
+      if (errorStr.includes('Conflict') || errorStr.includes('Duplicate feedback detected')) {
+        try {
+          const errorData = JSON.parse(errorStr);
+          if (errorData.similar_feedback && errorData.similar_feedback.length > 0) {
+            setSimilarFeedbacks(errorData.similar_feedback);
+            setSubmitting(false);
+            return;
+          }
+        } catch (parseErr) {
+          console.error("Failed to parse duplicate error:", parseErr);
+        }
+      }
+
       setError(err.message || "Failed to create feedback");
       setSubmitting(false);
     }

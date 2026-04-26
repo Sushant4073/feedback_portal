@@ -38,12 +38,18 @@ async function fetchAPI(url, options = {}) {
       headers,
     });
 
+    // Get response data first for Conflict webhook error
+    const data = await response.json().catch(() => ({}));
+
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
+      // For Conflict status, include the full response data for similar feedback
+      if (response.status === 409) {
+        throw new Error(JSON.stringify({ error: data.error || 'Conflict', ...data }));
+      }
+      throw new Error(data.error || `HTTP error! status: ${response.status}`);
     }
 
-    return await response.json();
+    return data;
   } catch (error) {
     console.error('API Error:', error);
     throw error;
@@ -52,15 +58,24 @@ async function fetchAPI(url, options = {}) {
 
 /**
  * Create a new feedback
+ * @param {Object} feedbackData - The feedback data
+ * @param {boolean} bypassDuplicateCheck - If true, bypass duplicate detection
  */
-export async function createFeedback(feedbackData) {
+export async function createFeedback(feedbackData, bypassDuplicateCheck = false) {
   const payload = { ...feedbackData };
   delete payload.category;
+
+  const headers = {
+    'Content-Type': 'application/json',
+  };
+
+  if (bypassDuplicateCheck) {
+    headers['X-Bypass-Duplicate-Check'] = 'true';
+  }
+
   return fetchAPI(`${API_BASE_URL}/feedback`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
+    headers,
     body: JSON.stringify(payload),
   });
 }

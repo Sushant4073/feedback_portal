@@ -184,26 +184,88 @@ func createFeedback(ctx context.Context, req events.APIGatewayProxyRequest) (eve
 	f.CommentCount = 0
 	f.Category = autoCategorizeFeedback(ctx, f)
 
+	// Check for bypass flag - if present, create feedback without duplicate check
+	bypassDuplicate := req.Headers["X-Bypass-Duplicate-Check"] == "true" ||
+		req.Headers["x-bypass-duplicate-check"] == "true"
+	if bypassDuplicate {
+		if err := repository.CreateFeedback(f); err != nil {
+			body, _ := json.Marshal(map[string]string{"error": err.Error()})
+			return events.APIGatewayProxyResponse{StatusCode: http.StatusInternalServerError, Body: string(body)}, nil
+		}
+
+		body, _ := json.Marshal(f)
+		return events.APIGatewayProxyResponse{
+			StatusCode: http.StatusOK,
+			Body:       string(body),
+		}, nil
+	}
+
+	// Step 1: Check for duplicates BEFORE creating any feedback record
+	// First try AI-based semantic duplicate detection
+	var similarFeedbacks []similarFeedbackItem
+	var aiCheckWorked bool
+
+	if existing, err := repository.GetRecentOpenFeedbackByTenant(f.TenantID, "", 15); err == nil && len(existing) > 0 {
+		log.Printf("createFeedback: Checking for duplicates among %d existing feedbacks (AI-based)", len(existing))
+
+		// Run duplicate check - this MUST complete before we create anything
+		similarFeedbacks = findSimilarFeedbackWithLLM(ctx, f.Title, f.Description, existing)
+		aiCheckWorked = len(similarFeedbacks) > 0
+
+		// If AI found duplicates, return 409 Conflict
+		if len(similarFeedbacks) > 0 {
+			log.Printf("createFeedback: Found %d duplicates (AI) - returning 409 Conflict", len(similarFeedbacks))
+			body, _ := json.Marshal(map[string]interface{}{
+				"error":            "Duplicate feedback detected",
+				"similar_feedback": similarFeedbacks,
+			})
+			return events.APIGatewayProxyResponse{
+				StatusCode: http.StatusConflict,
+				Body:       string(body),
+			}, nil
+		}
+	} else {
+		if err != nil {
+			log.Printf("createFeedback: Error fetching existing feedbacks for duplicate check: %v", err)
+		}
+		log.Printf("createFeedback: No existing feedbacks to check, proceeding with creation")
+	}
+
+	// Step 2: Fallback to simple title-based duplicate check if AI didn't find any duplicates or failed
+	if !aiCheckWorked {
+		titleMatch, err := repository.CheckTitleMatch(f.TenantID, f.Title)
+		if err != nil {
+			log.Printf("createFeedback: Error during title-based duplicate check: %v", err)
+		} else if titleMatch {
+			log.Printf("createFeedback: Title match found - returning 409 Conflict (fallback check)")
+			// Find the matching feedback to return similar items
+			existing, _ := repository.GetRecentOpenFeedbackByTenant(f.TenantID, "", 15)
+			similarFeedbacks = make([]similarFeedbackItem, 0)
+			for _, existingF := range existing {
+				if existingF.Title == f.Title {
+					similarFeedbacks = append(similarFeedbacks, similarFeedbackItem{ID: existingF.ID, Title: existingF.Title})
+				}
+			}
+
+			body, _ := json.Marshal(map[string]interface{}{
+				"error":            "Duplicate feedback detected",
+				"similar_feedback": similarFeedbacks,
+				"warning":         "AI duplicate check failed; falling back to title-based match",
+			})
+			return events.APIGatewayProxyResponse{
+				StatusCode: http.StatusConflict,
+				Body:       string(body),
+			}, nil
+		}
+	}
+
+	// Step 3: Only create feedback if no duplicates found
 	if err := repository.CreateFeedback(f); err != nil {
 		body, _ := json.Marshal(map[string]string{"error": err.Error()})
 		return events.APIGatewayProxyResponse{StatusCode: http.StatusInternalServerError, Body: string(body)}, nil
 	}
 
-	// Find similar existing feedback using LLM (best-effort — never blocks creation).
-	var similar []similarFeedbackItem
-	if existing, err := repository.GetRecentOpenFeedbackByTenant(f.TenantID, f.ID, 15); err == nil && len(existing) > 0 {
-		similar = findSimilarFeedbackWithLLM(ctx, f.Title, f.Description, existing)
-	}
-
-	// Build the response: keep all Feedback fields at top level and append similar_feedback.
-	respMap := map[string]interface{}{}
-	feedbackBytes, _ := json.Marshal(f)
-	json.Unmarshal(feedbackBytes, &respMap) //nolint:errcheck — marshal of known struct cannot fail
-	if len(similar) > 0 {
-		respMap["similar_feedback"] = similar
-	}
-
-	body, _ := json.Marshal(respMap)
+	body, _ := json.Marshal(f)
 	return events.APIGatewayProxyResponse{
 		StatusCode: http.StatusOK,
 		Body:       string(body),
@@ -221,6 +283,7 @@ type similarFeedbackItem struct {
 // create flow is never blocked.
 func findSimilarFeedbackWithLLM(ctx context.Context, newTitle, newDescription string, existing []models.Feedback) []similarFeedbackItem {
 	if strings.TrimSpace(cfg.AICategorizerURL) == "" || strings.TrimSpace(cfg.AICategorizerModel) == "" {
+		log.Printf("findSimilarFeedback: AI not configured - skipping duplicate check")
 		return nil
 	}
 
@@ -267,11 +330,13 @@ func findSimilarFeedbackWithLLM(ctx context.Context, newTitle, newDescription st
 
 	reqBody, err := json.Marshal(payload)
 	if err != nil {
+		log.Printf("findSimilarFeedback: failed to marshal request: %v", err)
 		return nil
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.AICategorizerURL, bytes.NewReader(reqBody))
 	if err != nil {
+		log.Printf("findSimilarFeedback: failed to create request: %v", err)
 		return nil
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -279,44 +344,54 @@ func findSimilarFeedbackWithLLM(ctx context.Context, newTitle, newDescription st
 		httpReq.Header.Set("Authorization", "Bearer "+cfg.AICategorizerAPIKey)
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		log.Printf("findSimilarFeedback: LLM request failed: %v", err)
+		log.Printf("findSimilarFeedback: LLM request failed: %v (URL: %s)", err, cfg.AICategorizerURL)
 		return nil
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		log.Printf("findSimilarFeedback: failed to read response: %v", err)
 		return nil
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		log.Printf("findSimilarFeedback: LLM API status %d: %s", resp.StatusCode, truncateForLog(string(respBody), 200))
+		log.Printf("findSimilarFeedback: LLM API returned status %d: %s", resp.StatusCode, truncateForLog(string(respBody), 200))
 		return nil
 	}
 
 	var parsed llmResponse
-	if err := json.Unmarshal(respBody, &parsed); err != nil || len(parsed.Choices) == 0 {
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		log.Printf("findSimilarFeedback: failed to unmarshal LLM response: %v", err)
+		return nil
+	}
+	if len(parsed.Choices) == 0 {
+		log.Printf("findSimilarFeedback: LLM returned no choices")
 		return nil
 	}
 
 	content := strings.TrimSpace(parsed.Choices[0].Message.Content)
+	log.Printf("findSimilarFeedback: LLM raw response: %s", truncateForLog(content, 500))
 
 	// Extract JSON array — LLMs sometimes prepend/append explanation text.
 	start := strings.Index(content, "[")
 	end := strings.LastIndex(content, "]")
 	if start == -1 || end == -1 || end <= start {
+		log.Printf("findSimilarFeedback: could not find JSON array in LLM response: %s", truncateForLog(content, 200))
 		return nil
 	}
 	content = content[start : end+1]
 
 	var similarIDs []string
 	if err := json.Unmarshal([]byte(content), &similarIDs); err != nil {
-		log.Printf("findSimilarFeedback: failed to parse LLM JSON response: %v, raw: %s", err, content)
+		log.Printf("findSimilarFeedback: failed to parse LLM JSON array: %v, raw: %s", err, content)
 		return nil
 	}
+
+	log.Printf("findSimilarFeedback: found %d similar feedbacks: %v", len(similarIDs), similarIDs)
 
 	// Map id → feedback for O(1) lookup.
 	idMap := make(map[string]models.Feedback, len(existing))
